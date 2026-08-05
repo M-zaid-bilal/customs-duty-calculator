@@ -1,0 +1,12 @@
+# Security / Environment Secrets
+.env
+*.pem
+
+# Replit / Local Virtual Envs
+.pythonlibs/
+__pycache__/
+*.pyc
+
+# Database files (optional: keep or ignore depending on setup)
+# Uncomment the line below if you don't want the SQLite binary in git:
+# db/*.db
