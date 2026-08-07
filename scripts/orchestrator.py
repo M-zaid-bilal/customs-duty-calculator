@@ -21,7 +21,7 @@ import chromadb
 from scripts.calculator import calculate_customs_duty, DB_PATH
 
 VECTOR_STORE_PATH = "vector_store"
-COLLECTION_NAME = "customs_legal_rules"
+COLLECTION_NAME = "customs_legal_acts"
 
 # In-Memory Cache Containers
 _EXACT_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
