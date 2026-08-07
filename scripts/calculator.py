@@ -8,7 +8,7 @@ sys.path.append(os.path.abspath("."))
 sys.path.append(os.path.abspath(".pythonlibs/lib/python3.11/site-packages"))
 
 # Import exchange rate engine from our exchange_rates module
-from scripts.exchange_rates import fetch_usd_to_pkr
+from scripts.exchange_rates import get_usd_to_pkr_rate as fetch_usd_to_pkr
 
 DB_PATH = "db/customs_master.db"
 
