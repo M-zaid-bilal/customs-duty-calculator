@@ -7,7 +7,11 @@ import hashlib
 import time
 import math
 from collections import Counter
-from typing import Optional, Dict, Any, List, Tuple,cast
+from typing import Optional, Dict, Any, List, Tuple, cast
+from dotenv import load_dotenv
+
+# Automatically load environment variables from .env file
+load_dotenv()
 
 # Ensure local packages & paths are accessible
 sys.path.append(os.path.abspath("."))
@@ -28,29 +32,15 @@ SYNONYMS_FILE_PATH = os.path.join("data", "consumer_synonyms.json")
 # In-Memory Cache Containers for Orchestrator Pipeline
 _EXACT_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
 _SEMANTIC_CACHE: List[Dict[str, Any]] = []
-_SEMANTIC_CACHE_MAX_SIZE = 500  # FIX #3: bound cache growth (was unbounded -> memory leak)
-
-# Global Gemini Context Cache handle
-_GEMINI_CACHE_HANDLE: Optional[str] = None
-_GEMINI_CACHE_EXPIRY: float = 0.0
-
-# FIX #2: cache the parsed synonyms dict at module scope instead of re-reading
-# the JSON file from disk on every single call to resolve_hs_code().
-_SYNONYMS_CACHE: Optional[Tuple[Dict[str, List[str]], Dict[str, List[str]]]] = None
 
 
 def load_consumer_synonyms() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """
     Loads trade synonyms and direct PCT matches from JSON file.
     Supports both flat key-value dictionaries and hierarchical category dictionaries.
-    Result is cached in-process after the first successful load (FIX #2).
     Returns:
       (synonyms_map, pct_matches_map)
     """
-    global _SYNONYMS_CACHE
-    if _SYNONYMS_CACHE is not None:
-        return _SYNONYMS_CACHE
-
     synonyms_map: Dict[str, List[str]] = {}
     pct_matches_map: Dict[str, List[str]] = {}
 
@@ -92,8 +82,7 @@ def load_consumer_synonyms() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]
                 elif isinstance(val, list):
                     synonyms_map[key.lower()] = [s.lower() for s in val]
 
-            _SYNONYMS_CACHE = (synonyms_map, pct_matches_map)
-            return _SYNONYMS_CACHE
+            return synonyms_map, pct_matches_map
         except Exception as e:
             print(f"⚠️ Notice: Could not load {SYNONYMS_FILE_PATH}: {e}")
 
@@ -105,8 +94,7 @@ def load_consumer_synonyms() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]
         "car": ["motor cars", "vehicles", "passenger"],
         "bull": ["bovine", "bovines", "animals"],
     }
-    _SYNONYMS_CACHE = (fallback_syns, {})
-    return _SYNONYMS_CACHE
+    return fallback_syns, {}
 
 
 class NativePythonEmbeddingFunction(EmbeddingFunction):
@@ -120,23 +108,13 @@ class NativePythonEmbeddingFunction(EmbeddingFunction):
     def _tokenize(self, text: str) -> List[str]:
         return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
 
-    @staticmethod
-    def _stable_hash(token: str) -> int:
-        # FIX #1: Python's built-in hash() is randomized per-process for strings
-        # (PYTHONHASHSEED) unless explicitly disabled. Because this embedding
-        # function backs a *persistent* Chroma store, using hash() means every
-        # process restart silently produces a different vector space than the
-        # one documents were indexed with -- queries stop matching anything
-        # meaningfully, with no error raised. hashlib.md5 is stable across runs.
-        return int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
-
     def _embed_text(self, text: str) -> List[float]:
         tokens = self._tokenize(text)
         vec = [0.0] * self.vector_dim
         if not tokens:
             return vec
         for token in tokens:
-            idx = self._stable_hash(token) % self.vector_dim
+            idx = abs(hash(token)) % self.vector_dim
             vec[idx] += 1.0
         norm = math.sqrt(sum(x * x for x in vec))
         if norm > 0:
@@ -144,7 +122,7 @@ class NativePythonEmbeddingFunction(EmbeddingFunction):
         return vec
 
     def __call__(self, input: Documents) -> Embeddings:
-        return [self._embed_text(doc) for doc in input]  # type: ignore[return-value]
+        return cast(Embeddings, [self._embed_text(doc) for doc in input])
 
 
 def _tokenize(text: str) -> List[str]:
@@ -169,78 +147,6 @@ def _cosine_similarity(vec1: Counter, vec2: Counter) -> float:
     if not magnitude:
         return 0.0
     return float(dot_product) / magnitude
-
-
-def get_or_create_context_cache(
-    client: genai.Client, model: str = "gemini-3.1-flash-lite"
-) -> Optional[str]:
-    """Creates or retrieves an explicit Gemini CachedContent resource."""
-    global _GEMINI_CACHE_HANDLE, _GEMINI_CACHE_EXPIRY
-    current_time = time.time()
-
-    if _GEMINI_CACHE_HANDLE and current_time < _GEMINI_CACHE_EXPIRY:
-        return _GEMINI_CACHE_HANDLE
-
-    try:
-        base_instructions = """
-You are an expert Pakistan Customs & Trade Consultant AI.
-Analyze the provided duty calculation breakdown and legal context snippets to generate a concise, professional assessment report.
-
-Formatting Guidelines:
-- State the resolved HS code and official FBR tariff description.
-- Present a clean, markdown-formatted duty breakdown table.
-- Highlight applicable legal rules, exemptions, or valuation conditions retrieved from the legal context.
-- Keep tone authoritative, clear, and scannable.
-"""
-        cache = client.caches.create(
-            model=model,
-            config=types.CreateCachedContentConfig(
-                contents=base_instructions.strip(),
-                ttl="3600s",
-            ),
-        )
-        _GEMINI_CACHE_HANDLE = cache.name
-        _GEMINI_CACHE_EXPIRY = current_time + 3500
-        print(f"✅ Created Gemini Context Cache: {cache.name}")
-        return _GEMINI_CACHE_HANDLE
-    except Exception as e:
-        print(f"ℹ️ Context Cache Notice: {e} (Falling back to standard prompt execution)")
-        return None
-
-
-def _best_scored_rows(
-    cursor: sqlite3.Cursor, candidate_terms: List[str], keywords: List[str], limit: int = 5
-) -> List[Tuple[str, str, float]]:
-    """
-    FIX #4: Search the DB for every candidate term (instead of stopping at the
-    first term that returns *any* row), then rank all collected rows by how
-    many of the original keywords actually appear in the description. This
-    avoids returning an early, low-relevance match just because it happened
-    to be searched first (e.g. "black leather jacket" no longer risks
-    resolving on an unrelated heading that merely mentions "black").
-    """
-    seen: Dict[str, Tuple[str, str, float]] = {}
-    for term in candidate_terms:
-        query_term = f"%{term}%"
-        cursor.execute(
-            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 20",
-            (query_term,),
-        )
-        for hs, desc, cd in cursor.fetchall():
-            if hs not in seen:
-                seen[hs] = (hs, desc, cd)
-
-    if not seen:
-        return []
-
-    scored = []
-    for hs, desc, cd in seen.values():
-        desc_lower = desc.lower()
-        score = sum(1 for kw in keywords if kw in desc_lower)
-        scored.append((score, hs, desc, cd))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [(hs, desc, cd) for _, hs, desc, cd in scored[:limit]]
 
 
 def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]:
@@ -289,23 +195,36 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
                     matches.extend(res)
                     break
 
-        # Tier 1: SQL Keyword Search (FIX #4: score across all keywords, don't stop at first hit)
+        # Tier 1: SQL Keyword Search
         if not matches and keywords:
-            best_rows = _best_scored_rows(cursor, keywords, keywords)
-            if best_rows:
-                matches.extend(best_rows)
+            for kw in keywords:
+                query_term = f"%{kw}%"
+                cursor.execute(
+                    "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
+                    (query_term,),
+                )
+                res = cursor.fetchall()
+                if res:
+                    matches.extend(res)
+                    break
 
-        # Tier 2: Synonym Expansion (FIX #4: same scoring approach)
+        # Tier 2: Synonym Expansion
         if not matches and keywords:
             expanded_terms = []
             for kw in keywords:
                 if kw in synonyms_dict:
                     expanded_terms.extend(synonyms_dict[kw])
 
-            if expanded_terms:
-                best_rows = _best_scored_rows(cursor, expanded_terms, keywords)
-                if best_rows:
-                    matches.extend(best_rows)
+            for syn in expanded_terms:
+                query_term = f"%{syn}%"
+                cursor.execute(
+                    "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
+                    (query_term,),
+                )
+                res = cursor.fetchall()
+                if res:
+                    matches.extend(res)
+                    break
 
         # Tier 3: Gemini AI Expansion Fallback
         if not matches and keywords:
@@ -318,22 +237,8 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
                         model="gemini-3.1-flash-lite",
                         contents=ai_prompt
                     )
-                    # Safely extract text from the AI response which may be None or under different attrs
-                    raw_text = ""
-                    if hasattr(response, "text") and response.text is not None:
-                        raw_text = response.text
-                    elif isinstance(response, dict):
-                        # guard for dict-shaped responses
-                        raw_text = response.get("text") or response.get("content") or ""
-
-                    # ensure a str and normalize
-                    if isinstance(raw_text, bytes):
-                        try:
-                            raw_text = raw_text.decode("utf-8", errors="ignore")
-                        except Exception:
-                            raw_text = ""
-
-                    ai_suggestion = (raw_text or "").strip().replace(".", "")
+                    ai_response_text = getattr(response, "text", "") or ""
+                    ai_suggestion = ai_response_text.strip().replace(".", "")
                     ai_hs_digits = re.sub(r"\D", "", ai_suggestion)
 
                     if len(ai_hs_digits) >= 4:
@@ -482,7 +387,8 @@ def get_legal_context(query_text: str, n_results: int = 2) -> List[Dict[str, str
                             )
                             contexts.append({"source": str(source_name), "text": doc.strip()})
         except Exception as e:
-            print(f"⚠️ ChromaDB Retrieval Warning: {e}")
+            # Silent fallback without cluttering console logs
+            pass
 
     # Fallback statutory legal provisions
     if not contexts:
@@ -596,20 +502,11 @@ Formatting Guidelines:
             user_prompt = f"User Query: {user_query}\n\nData Context:\n{json.dumps(context_payload, indent=2)}"
             model_name = "gemini-3.1-flash-lite"
 
-            cache_name = get_or_create_context_cache(client, model=model_name)
-
-            if cache_name:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=user_prompt,
-                    config=types.GenerateContentConfig(cached_content=cache_name),
-                )
-            else:
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=user_prompt,
-                    config=types.GenerateContentConfig(system_instruction=system_prompt),
-                )
+            response = client.models.generate_content(
+                model=model_name,
+                contents=user_prompt,
+                config=types.GenerateContentConfig(system_instruction=system_prompt),
+            )
 
             report_text = response.text or ""
         except Exception as e:
@@ -633,11 +530,6 @@ Formatting Guidelines:
     }
 
     _EXACT_QUERY_CACHE[exact_hash] = result_payload
-
-    # FIX #3: bound the semantic cache instead of growing it forever.
-    if len(_SEMANTIC_CACHE) >= _SEMANTIC_CACHE_MAX_SIZE:
-        _SEMANTIC_CACHE.pop(0)  # evict oldest entry (simple FIFO)
-
     _SEMANTIC_CACHE.append(
         {
             "query_vec": _vectorize(_tokenize(f"{user_query} {item_description}")),

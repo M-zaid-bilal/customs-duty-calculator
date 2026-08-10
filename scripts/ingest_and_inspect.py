@@ -103,8 +103,11 @@ def setup_database():
 
                             description = row[1].strip() if row[1] else ""
                             try:
-                                cd_rate = float(row[2].strip().replace("%", "")) / 100.0
-                            except (ValueError, AttributeError):
+                                raw_cd_rate = row[2]
+                                if raw_cd_rate is None:
+                                    raise ValueError
+                                cd_rate = float(str(raw_cd_rate).strip().replace("%", "")) / 100.0
+                            except (ValueError, AttributeError, TypeError):
                                 cd_rate = 0.0
 
                             cursor.execute(
