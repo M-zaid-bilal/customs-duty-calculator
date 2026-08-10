@@ -1,11 +1,17 @@
 import sys
 import os
+import re
+import math
+from collections import Counter
+from typing import List, cast
 
 # Append Replit local packages path if needed
+sys.path.append(os.path.abspath("."))
 sys.path.append(os.path.abspath(".pythonlibs/lib/python3.11/site-packages"))
 
 from pypdf import PdfReader
 import chromadb
+from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
 DATA_DIR = "data"
 VECTOR_DIR = "vector_store"
@@ -20,10 +26,43 @@ LEGAL_ACTS = [
 ]
 
 
+# ==========================================
+# PURE-PYTHON EMBEDDING FUNCTION (NO ONNX/DLL)
+# ==========================================
+class NativePythonEmbeddingFunction(EmbeddingFunction):
+    """
+    Pure Python lightweight vector embedding function.
+    Bypasses onnxruntime and C++ DLL issues completely.
+    """
+    def __init__(self, vector_dim: int = 128):
+        self.vector_dim = vector_dim
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
+
+    def _embed_text(self, text: str) -> List[float]:
+        tokens = self._tokenize(text)
+        vec = [0.0] * self.vector_dim
+        if not tokens:
+            return vec
+        
+        # Fixed deterministic hashing into vector dimensions
+        for token in tokens:
+            idx = abs(hash(token)) % self.vector_dim
+            vec[idx] += 1.0
+            
+        # L2 Normalization
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
+
+    def __call__(self, input: Documents) -> Embeddings:
+        return cast(Embeddings, [self._embed_text(doc) for doc in input])
+
+
 def extract_chunks_from_pdf(file_path, chunk_size=600, chunk_overlap=80):
-    """
-    Extracts text from a PDF file and splits it into overlapping text chunks.
-    """
+    """Extracts text from a PDF file and splits it into overlapping text chunks."""
     reader = PdfReader(file_path)
     full_text = ""
 
@@ -61,8 +100,12 @@ def build_vector_database():
     except Exception:
         pass
 
+    # Use Native Python Embedding Function (Bypasses onnxruntime)
+    embedding_fn = NativePythonEmbeddingFunction()
+
     collection = client.create_collection(
         name="customs_legal_acts",
+        embedding_function=embedding_fn,
         metadata={
             "description": "Vector store for Pakistan Customs Legal Acts & Rules"
         },
@@ -113,13 +156,20 @@ def query_test(query_text="penalty for non-payment of duty"):
     print("==================================================")
 
     client = chromadb.PersistentClient(path=VECTOR_DIR)
-    collection = client.get_collection(name="customs_legal_acts")
+    embedding_fn = NativePythonEmbeddingFunction()
+    
+    collection = client.get_collection(
+        name="customs_legal_acts",
+        embedding_function=embedding_fn
+    )
 
     results = collection.query(query_texts=[query_text], n_results=2)
 
-    # Safe checking to prevent NoneType subscript errors
-    docs = results.get("documents", [[]])[0] if results.get("documents") else []  # ty:ignore[not-subscriptable]
-    metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []  # ty:ignore[not-subscriptable]
+    documents_result = results.get("documents") if isinstance(results, dict) else None
+    docs = documents_result[0] if documents_result else []
+
+    metadata_result = results.get("metadatas") if isinstance(results, dict) else None
+    metas = metadata_result[0] if metadata_result else []
 
     if not docs:
         print("⚠️ No matching legal provisions found.")

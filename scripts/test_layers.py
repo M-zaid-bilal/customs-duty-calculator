@@ -67,8 +67,11 @@ def query_vector_store(legal_query, n_results=2):
 
     results = collection.query(query_texts=[legal_query], n_results=n_results)
 
-    docs = results.get("documents", [[]])[0] if results.get("documents") else []
-    metas = results.get("metadatas", [[]])[0] if results.get("metadatas") else []
+    documents = results.get("documents")
+    metadata_list = results.get("metadatas")
+
+    docs = documents[0] if isinstance(documents, list) and documents else []
+    metas = metadata_list[0] if isinstance(metadata_list, list) and metadata_list else []
 
     if not docs:
         print("⚠️ No matching legal provisions found.")

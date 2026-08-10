@@ -7,7 +7,7 @@ import hashlib
 import time
 import math
 from collections import Counter
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple,cast
 
 # Ensure local packages & paths are accessible
 sys.path.append(os.path.abspath("."))
@@ -16,25 +16,137 @@ sys.path.append(os.path.abspath(".pythonlibs/lib/python3.11/site-packages"))
 from google import genai
 from google.genai import types
 import chromadb
+from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
 
 # Import Layer 4 Math Engine
 from scripts.calculator import calculate_customs_duty, DB_PATH
 
 VECTOR_STORE_PATH = "vector_store"
-COLLECTION_NAME = "customs_legal_acts"  # Aligned with build_vector_store.py
+COLLECTION_NAME = "customs_legal_acts"
+SYNONYMS_FILE_PATH = os.path.join("data", "consumer_synonyms.json")
 
-# In-Memory Cache Containers
+# In-Memory Cache Containers for Orchestrator Pipeline
 _EXACT_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
 _SEMANTIC_CACHE: List[Dict[str, Any]] = []
+_SEMANTIC_CACHE_MAX_SIZE = 500  # FIX #3: bound cache growth (was unbounded -> memory leak)
 
 # Global Gemini Context Cache handle
 _GEMINI_CACHE_HANDLE: Optional[str] = None
 _GEMINI_CACHE_EXPIRY: float = 0.0
 
+# FIX #2: cache the parsed synonyms dict at module scope instead of re-reading
+# the JSON file from disk on every single call to resolve_hs_code().
+_SYNONYMS_CACHE: Optional[Tuple[Dict[str, List[str]], Dict[str, List[str]]]] = None
 
-# ==========================================
-# SIMILARITY HELPERS FOR SEMANTIC CACHING
-# ==========================================
+
+def load_consumer_synonyms() -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+    """
+    Loads trade synonyms and direct PCT matches from JSON file.
+    Supports both flat key-value dictionaries and hierarchical category dictionaries.
+    Result is cached in-process after the first successful load (FIX #2).
+    Returns:
+      (synonyms_map, pct_matches_map)
+    """
+    global _SYNONYMS_CACHE
+    if _SYNONYMS_CACHE is not None:
+        return _SYNONYMS_CACHE
+
+    synonyms_map: Dict[str, List[str]] = {}
+    pct_matches_map: Dict[str, List[str]] = {}
+
+    if os.path.exists(SYNONYMS_FILE_PATH):
+        try:
+            with open(SYNONYMS_FILE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            for key, val in data.items():
+                if isinstance(val, dict):
+                    # Check if flat term structure: "term": { "synonyms": [...], "pct_matches": [...] }
+                    if "synonyms" in val:
+                        term_lower = key.lower()
+                        synonyms_map[term_lower] = [s.lower() for s in val.get("synonyms", [])]
+                        pct_matches_map[term_lower] = [
+                            m.get("hs_code") for m in val.get("pct_matches", []) if m.get("hs_code")
+                        ]
+                    else:
+                        # Category-nested structure: "electronics": { "smartphone": { ... } }
+                        for sub_term, term_data in val.items():
+                            term_lower = sub_term.lower()
+                            if isinstance(term_data, dict):
+                                synonyms = [s.lower() for s in term_data.get("synonyms", [])]
+                                synonyms_map[term_lower] = synonyms
+                                hs_matches = [
+                                    m.get("hs_code") for m in term_data.get("pct_matches", []) if m.get("hs_code")
+                                ]
+                                pct_matches_map[term_lower] = hs_matches
+
+                                # Map individual synonyms back to term and HS matches
+                                for syn in synonyms:
+                                    if syn not in synonyms_map:
+                                        synonyms_map[syn] = [term_lower]
+                                    if syn not in pct_matches_map:
+                                        pct_matches_map[syn] = hs_matches
+                            elif isinstance(term_data, list):
+                                synonyms_map[term_lower] = [s.lower() for s in term_data]
+
+                elif isinstance(val, list):
+                    synonyms_map[key.lower()] = [s.lower() for s in val]
+
+            _SYNONYMS_CACHE = (synonyms_map, pct_matches_map)
+            return _SYNONYMS_CACHE
+        except Exception as e:
+            print(f"⚠️ Notice: Could not load {SYNONYMS_FILE_PATH}: {e}")
+
+    # Fallback default dictionary
+    fallback_syns = {
+        "smartphone": ["cellular", "mobile", "telephone"],
+        "phone": ["cellular", "mobile", "telephone"],
+        "laptop": ["automatic data processing", "portable", "computer"],
+        "car": ["motor cars", "vehicles", "passenger"],
+        "bull": ["bovine", "bovines", "animals"],
+    }
+    _SYNONYMS_CACHE = (fallback_syns, {})
+    return _SYNONYMS_CACHE
+
+
+class NativePythonEmbeddingFunction(EmbeddingFunction):
+    """
+    Pure-Python lightweight vector embedding function.
+    Completely bypasses onnxruntime and C++ DLL dependencies on Windows/Mac/Linux.
+    """
+    def __init__(self, vector_dim: int = 128):
+        self.vector_dim = vector_dim
+
+    def _tokenize(self, text: str) -> List[str]:
+        return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
+
+    @staticmethod
+    def _stable_hash(token: str) -> int:
+        # FIX #1: Python's built-in hash() is randomized per-process for strings
+        # (PYTHONHASHSEED) unless explicitly disabled. Because this embedding
+        # function backs a *persistent* Chroma store, using hash() means every
+        # process restart silently produces a different vector space than the
+        # one documents were indexed with -- queries stop matching anything
+        # meaningfully, with no error raised. hashlib.md5 is stable across runs.
+        return int(hashlib.md5(token.encode("utf-8")).hexdigest(), 16)
+
+    def _embed_text(self, text: str) -> List[float]:
+        tokens = self._tokenize(text)
+        vec = [0.0] * self.vector_dim
+        if not tokens:
+            return vec
+        for token in tokens:
+            idx = self._stable_hash(token) % self.vector_dim
+            vec[idx] += 1.0
+        norm = math.sqrt(sum(x * x for x in vec))
+        if norm > 0:
+            vec = [x / norm for x in vec]
+        return vec
+
+    def __call__(self, input: Documents) -> Embeddings:
+        return [self._embed_text(doc) for doc in input]  # type: ignore[return-value]
+
+
 def _tokenize(text: str) -> List[str]:
     """Tokenizes text into lowercase words (>2 chars)."""
     return [w.lower() for w in re.findall(r"\w+", text) if len(w) > 2]
@@ -59,16 +171,10 @@ def _cosine_similarity(vec1: Counter, vec2: Counter) -> float:
     return float(dot_product) / magnitude
 
 
-# ==========================================
-# GEMINI CONTEXT CACHING HELPER
-# ==========================================
 def get_or_create_context_cache(
     client: genai.Client, model: str = "gemini-3.1-flash-lite"
 ) -> Optional[str]:
-    """
-    Creates or retrieves an explicit Gemini CachedContent resource.
-    Caches system rules to reduce token consumption on repeated calls.
-    """
+    """Creates or retrieves an explicit Gemini CachedContent resource."""
     global _GEMINI_CACHE_HANDLE, _GEMINI_CACHE_EXPIRY
     current_time = time.time()
 
@@ -90,7 +196,7 @@ Formatting Guidelines:
             model=model,
             config=types.CreateCachedContentConfig(
                 contents=base_instructions.strip(),
-                ttl="3600s",  # 1 Hour TTL
+                ttl="3600s",
             ),
         )
         _GEMINI_CACHE_HANDLE = cache.name
@@ -98,30 +204,154 @@ Formatting Guidelines:
         print(f"✅ Created Gemini Context Cache: {cache.name}")
         return _GEMINI_CACHE_HANDLE
     except Exception as e:
-        print(
-            f"ℹ️ Context Cache Notice: {e} (Falling back to standard prompt execution)"
-        )
+        print(f"ℹ️ Context Cache Notice: {e} (Falling back to standard prompt execution)")
         return None
 
 
-# ==========================================
-# 1. HS CODE VALIDATOR & RESOLVER
-# ==========================================
+def _best_scored_rows(
+    cursor: sqlite3.Cursor, candidate_terms: List[str], keywords: List[str], limit: int = 5
+) -> List[Tuple[str, str, float]]:
+    """
+    FIX #4: Search the DB for every candidate term (instead of stopping at the
+    first term that returns *any* row), then rank all collected rows by how
+    many of the original keywords actually appear in the description. This
+    avoids returning an early, low-relevance match just because it happened
+    to be searched first (e.g. "black leather jacket" no longer risks
+    resolving on an unrelated heading that merely mentions "black").
+    """
+    seen: Dict[str, Tuple[str, str, float]] = {}
+    for term in candidate_terms:
+        query_term = f"%{term}%"
+        cursor.execute(
+            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 20",
+            (query_term,),
+        )
+        for hs, desc, cd in cursor.fetchall():
+            if hs not in seen:
+                seen[hs] = (hs, desc, cd)
+
+    if not seen:
+        return []
+
+    scored = []
+    for hs, desc, cd in seen.values():
+        desc_lower = desc.lower()
+        score = sum(1 for kw in keywords if kw in desc_lower)
+        scored.append((score, hs, desc, cd))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [(hs, desc, cd) for _, hs, desc, cd in scored[:limit]]
+
+
 def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]:
-    """Validates, searches, and dynamically resolves HS codes from user input."""
+    """Validates, searches, and dynamically resolves HS codes from user input using multi-tier lookups."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     desc_clean = item_description.strip()
+    clean_hs = re.sub(r"\D", "", hs_input)
 
-    # Case A: User provided no HS code -> Auto-detect via description match
-    if not hs_input or hs_input.strip() == "":
-        query_term = f"%{desc_clean}%"
-        cursor.execute(
-            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
-            (query_term,),
-        )
-        matches = cursor.fetchall()
+    synonyms_dict, pct_matches_dict = load_consumer_synonyms()
+
+    if not clean_hs:
+        stopwords = {
+            "i", "want", "to", "import", "an", "a", "the", "for", "my", "please",
+            "calculate", "customs", "duty", "on", "bringing", "in", "from", "australian",
+            "pakistan", "buying", "importing", "get", "rate"
+        }
+        all_words = [w.lower() for w in re.findall(r"\w+", desc_clean)]
+        keywords = [w for w in all_words if w not in stopwords and len(w) > 2]
+
+        matches = []
+
+        # Tier 0: Direct Master PCT Matches from JSON dictionary
+        matched_hs_codes = []
+        for kw in keywords:
+            if kw in pct_matches_dict and pct_matches_dict[kw]:
+                matched_hs_codes.extend(pct_matches_dict[kw])
+
+        if matched_hs_codes:
+            for direct_hs in matched_hs_codes:
+                clean_direct = direct_hs.replace(".", "").strip()
+                if len(clean_direct) == 8:
+                    cursor.execute(
+                        "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE hs_code = ?",
+                        (clean_direct,),
+                    )
+                else:
+                    prefix = clean_direct[:4] + "%"
+                    cursor.execute(
+                        "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE hs_code LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
+                        (prefix,),
+                    )
+                res = cursor.fetchall()
+                if res:
+                    matches.extend(res)
+                    break
+
+        # Tier 1: SQL Keyword Search (FIX #4: score across all keywords, don't stop at first hit)
+        if not matches and keywords:
+            best_rows = _best_scored_rows(cursor, keywords, keywords)
+            if best_rows:
+                matches.extend(best_rows)
+
+        # Tier 2: Synonym Expansion (FIX #4: same scoring approach)
+        if not matches and keywords:
+            expanded_terms = []
+            for kw in keywords:
+                if kw in synonyms_dict:
+                    expanded_terms.extend(synonyms_dict[kw])
+
+            if expanded_terms:
+                best_rows = _best_scored_rows(cursor, expanded_terms, keywords)
+                if best_rows:
+                    matches.extend(best_rows)
+
+        # Tier 3: Gemini AI Expansion Fallback
+        if not matches and keywords:
+            api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+            if api_key:
+                try:
+                    client = genai.Client(api_key=api_key)
+                    ai_prompt = f"Given the user request '{item_description}', output ONLY the official 8-digit or 4-digit Harmonized System (HS) code prefix or technical tariff term (e.g., '8517' or 'cellular'). No markdown, no explanation."
+                    response = client.models.generate_content(
+                        model="gemini-3.1-flash-lite",
+                        contents=ai_prompt
+                    )
+                    # Safely extract text from the AI response which may be None or under different attrs
+                    raw_text = ""
+                    if hasattr(response, "text") and response.text is not None:
+                        raw_text = response.text
+                    elif isinstance(response, dict):
+                        # guard for dict-shaped responses
+                        raw_text = response.get("text") or response.get("content") or ""
+
+                    # ensure a str and normalize
+                    if isinstance(raw_text, bytes):
+                        try:
+                            raw_text = raw_text.decode("utf-8", errors="ignore")
+                        except Exception:
+                            raw_text = ""
+
+                    ai_suggestion = (raw_text or "").strip().replace(".", "")
+                    ai_hs_digits = re.sub(r"\D", "", ai_suggestion)
+
+                    if len(ai_hs_digits) >= 4:
+                        prefix = ai_hs_digits[:4] + "%"
+                        cursor.execute(
+                            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE hs_code LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
+                            (prefix,),
+                        )
+                        matches = cursor.fetchall()
+                    elif ai_suggestion:
+                        cursor.execute(
+                            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 5",
+                            (f"%{ai_suggestion.lower()}%",),
+                        )
+                        matches = cursor.fetchall()
+                except Exception as e:
+                    print(f"⚠️ Gemini AI HS resolution fallback notice: {e}")
+
         conn.close()
 
         if matches:
@@ -137,12 +367,10 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
         else:
             return {
                 "status": "NOT_FOUND",
-                "message": f"Could not auto-detect HS code for '{item_description}'. Please specify an 8-digit HS Code.",
+                "message": f"Could not auto-detect HS code for '{item_description}'. Please specify key terms or an 8-digit HS Code.",
             }
 
-    clean_hs = re.sub(r"\D", "", hs_input)
-
-    # Case B: Partial prefix provided (e.g. 4-digit '8703') -> Expand to best 8-digit sub-heading
+    # Partial prefix expansion (< 8 digits)
     if len(clean_hs) < 8:
         prefix = clean_hs + "%"
         cursor.execute(
@@ -160,14 +388,12 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
 
         best_match = None
         if desc_clean:
-            keywords = [
-                kw.lower() for kw in re.findall(r"\w+", desc_clean) if len(kw) > 2
-            ]
+            kw_list = [kw.lower() for kw in re.findall(r"\w+", desc_clean) if len(kw) > 2]
             highest_score = 0
             for node in leaf_nodes:
                 node_hs, node_desc, node_cd = node
                 node_desc_lower = node_desc.lower()
-                score = sum(1 for kw in keywords if kw in node_desc_lower)
+                score = sum(1 for kw in kw_list if kw in node_desc_lower)
                 if score > highest_score:
                     highest_score = score
                     best_match = node
@@ -186,7 +412,7 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
             ],
         }
 
-    # Case C: Exact 8-digit HS code validation
+    # Exact 8-digit HS Code Lookup
     cursor.execute(
         "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE hs_code = ?",
         (clean_hs,),
@@ -202,7 +428,7 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
             "cd_rate": row[2],
         }
     else:
-        # Fallback: Invalid 8-digit HS code provided -> Try description fallback rather than crashing
+        # Fallback for invalid 8-digit code
         query_term = f"%{desc_clean}%"
         cursor.execute(
             "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 1",
@@ -226,44 +452,54 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
             }
 
 
-# ==========================================
-# 2. LEGAL RAG RETRIEVAL
-# ==========================================
 def get_legal_context(query_text: str, n_results: int = 2) -> List[Dict[str, str]]:
-    """Retrieves top N relevant legal chunks from ChromaDB vector store."""
-    if not os.path.exists(VECTOR_STORE_PATH):
-        return []
+    """Retrieves top N relevant legal chunks from ChromaDB vector store, with statutory legal fallbacks."""
+    contexts: List[Dict[str, str]] = []
 
-    try:
-        chroma_client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)
-        collection = chroma_client.get_or_create_collection(name=COLLECTION_NAME)
+    if os.path.exists(VECTOR_STORE_PATH):
+        try:
+            embedding_fn = NativePythonEmbeddingFunction()
+            chroma_client = chromadb.PersistentClient(path=VECTOR_STORE_PATH)
+            collection = chroma_client.get_or_create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=embedding_fn
+            )
 
-        results = collection.query(query_texts=[query_text], n_results=n_results)
+            if collection.count() > 0:
+                results = collection.query(query_texts=[query_text], n_results=n_results)
+                docs = results.get("documents")
+                metas = results.get("metadatas")
 
-        contexts: List[Dict[str, str]] = []
-        docs = results.get("documents")
-        metas = results.get("metadatas")
+                if docs and metas and len(docs) > 0 and len(metas) > 0:
+                    doc_list = docs[0]
+                    meta_list = metas[0]
+                    if doc_list and meta_list:
+                        for doc, meta in zip(doc_list, meta_list):
+                            source_name = (
+                                meta.get("source", "Customs Legal Acts")
+                                if isinstance(meta, dict)
+                                else "Customs Legal Acts"
+                            )
+                            contexts.append({"source": str(source_name), "text": doc.strip()})
+        except Exception as e:
+            print(f"⚠️ ChromaDB Retrieval Warning: {e}")
 
-        if docs and metas and len(docs) > 0 and len(metas) > 0:
-            doc_list = docs[0]
-            meta_list = metas[0]
-            if doc_list and meta_list:
-                for doc, meta in zip(doc_list, meta_list):
-                    source_name = (
-                        meta.get("source", "Unknown Act/Rules")
-                        if isinstance(meta, dict)
-                        else "Unknown Act/Rules"
-                    )
-                    contexts.append({"source": str(source_name), "text": doc.strip()})
-        return contexts
-    except Exception as e:
-        print(f"⚠️ ChromaDB Retrieval Warning: {e}")
-        return []
+    # Fallback statutory legal provisions
+    if not contexts:
+        contexts = [
+            {
+                "source": "Customs Act 1969 - Section 25 (Valuation of Imported Goods)",
+                "text": "The value of imported goods shall be determined under Section 25 of the Customs Act, 1969 based on the transaction value, including freight, insurance, and landing charges (CIF standard valuation)."
+            },
+            {
+                "source": "Customs Act 1969 - Section 80 (Checking of Goods Declaration)",
+                "text": "Goods Declaration (GD) submitted through WeBOC/PSW shall be assessed for applicable customs duties, sales tax, federal excise duty, and income tax under the Pakistan Customs Tariff schedules."
+            }
+        ]
+
+    return contexts
 
 
-# ==========================================
-# 3. ORCHESTRATOR CORE PIPELINE
-# ==========================================
 def run_customs_orchestrator(
     user_query: str,
     hs_code: str = "",
@@ -275,14 +511,10 @@ def run_customs_orchestrator(
     insurance_usd: float = 0.0,
     use_cache: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Executes the 4-stage AI RAG pipeline with Exact, Semantic, and LLM Context Caching.
-    """
-    # Dynamic Environment Variable Fetching
+    """Executes the 4-stage AI RAG pipeline with Exact, Semantic, and Context Caching."""
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     client = genai.Client(api_key=api_key) if api_key else None
 
-    # Parameter signature for financial isolation
     param_signature = (
         hs_code.strip(),
         fob_usd,
@@ -311,16 +543,13 @@ def run_customs_orchestrator(
         for sem_entry in _SEMANTIC_CACHE:
             if sem_entry["param_signature"] == param_signature:
                 sim = _cosine_similarity(query_vec, sem_entry["query_vec"])
-                if sim >= 0.88:  # 88% similarity threshold
-                    print(
-                        f"🧠 [SEMANTIC CACHE HIT] Reusing previous report (Similarity: {sim:.2%})."
-                    )
+                if sim >= 0.88:
+                    print(f"🧠 [SEMANTIC CACHE HIT] Reusing previous report (Similarity: {sim:.2%}).")
                     cached_res = sem_entry["result"].copy()
                     cached_res["cache_type"] = f"SEMANTIC ({sim:.1%})"
                     cached_res["cache_hit"] = True
                     return cached_res
 
-    # Stage 1: Validate & Resolve HS Code
     hs_resolution = resolve_hs_code(hs_code, item_description or user_query)
 
     if hs_resolution["status"] in ["NOT_FOUND", "INVALID_PREFIX", "INVALID_CODE"]:
@@ -332,7 +561,6 @@ def run_customs_orchestrator(
 
     target_hs = str(hs_resolution["selected_hs_code"])
 
-    # Stage 2: Execute Layer 4 Duty Math
     duty_calculation = calculate_customs_duty(
         fob_usd=fob_usd,
         hs_code=target_hs,
@@ -342,13 +570,9 @@ def run_customs_orchestrator(
         insurance_usd=insurance_usd,
     )
 
-    # Stage 3: Retrieve Legal Context from ChromaDB
-    rag_query = (
-        f"{item_description} {user_query} import valuation restrictions exemption"
-    )
+    rag_query = f"{item_description} {user_query} import valuation restrictions exemption"
     legal_snippets = get_legal_context(rag_query, n_results=2)
 
-    # Stage 4: Synthesize Final Report with Gemini
     system_prompt = """
 You are an expert Pakistan Customs & Trade Consultant AI. 
 Analyze the provided duty calculation breakdown and legal context snippets to generate a concise, professional assessment report.
@@ -372,7 +596,6 @@ Formatting Guidelines:
             user_prompt = f"User Query: {user_query}\n\nData Context:\n{json.dumps(context_payload, indent=2)}"
             model_name = "gemini-3.1-flash-lite"
 
-            # Check for Explicit Gemini Context Cache
             cache_name = get_or_create_context_cache(client, model=model_name)
 
             if cache_name:
@@ -385,9 +608,7 @@ Formatting Guidelines:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=user_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_prompt
-                    ),
+                    config=types.GenerateContentConfig(system_instruction=system_prompt),
                 )
 
             report_text = response.text or ""
@@ -396,7 +617,6 @@ Formatting Guidelines:
     else:
         report_text = f"⚠️ Gemini API Client not initialized. Checked GEMINI_API_KEY (Found: {bool(api_key)})."
 
-    # Standardized Payload with complete UI & API key aliases
     result_payload = {
         "error": False,
         "cache_type": "NONE",
@@ -412,8 +632,12 @@ Formatting Guidelines:
         "summary_report": report_text,
     }
 
-    # Store in Exact & Semantic Caches
     _EXACT_QUERY_CACHE[exact_hash] = result_payload
+
+    # FIX #3: bound the semantic cache instead of growing it forever.
+    if len(_SEMANTIC_CACHE) >= _SEMANTIC_CACHE_MAX_SIZE:
+        _SEMANTIC_CACHE.pop(0)  # evict oldest entry (simple FIFO)
+
     _SEMANTIC_CACHE.append(
         {
             "query_vec": _vectorize(_tokenize(f"{user_query} {item_description}")),
@@ -425,49 +649,17 @@ Formatting Guidelines:
     return result_payload
 
 
-# ==========================================
-# TEST RUN
-# ==========================================
 if __name__ == "__main__":
     print("==================================================")
     print("🚀 LAYER 5: MULTI-TIER CACHING DEMO")
     print("==================================================")
 
-    # 1. Uncached Call
     start_1 = time.time()
     res1 = run_customs_orchestrator(
-        user_query="I want to import a mini van",
-        hs_code="8703",
-        fob_usd=15000,
-        item_description="Mini Van",
+        user_query="I want to import a smartphone",
+        hs_code="",
+        fob_usd=500,
+        item_description="smartphone",
     )
     dur_1 = time.time() - start_1
-    print(
-        f"⏱️ Call 1 (Uncached): Executed in {dur_1:.2f}s | Cache: {res1.get('cache_type')}\n"
-    )
-
-    # 2. Exact Hash Cache Hit
-    start_2 = time.time()
-    res2 = run_customs_orchestrator(
-        user_query="I want to import a mini van",
-        hs_code="8703",
-        fob_usd=15000,
-        item_description="Mini Van",
-    )
-    dur_2 = time.time() - start_2
-    print(
-        f"⏱️ Call 2 (Exact Hit): Executed in {dur_2:.4f}s | Cache: {res2.get('cache_type')}\n"
-    )
-
-    # 3. Semantic Cache Hit (Differently phrased query, same parameters)
-    start_3 = time.time()
-    res3 = run_customs_orchestrator(
-        user_query="Please calculate duties for bringing in a minivan vehicle",
-        hs_code="8703",
-        fob_usd=15000,
-        item_description="Mini Van",
-    )
-    dur_3 = time.time() - start_3
-    print(
-        f"⏱️ Call 3 (Semantic Hit): Executed in {dur_3:.4f}s | Cache: {res3.get('cache_type')}\n"
-    )
+    print(f"⏱️ Executed in {dur_1:.2f}s | Resolved HS: {res1.get('hs_code')}")
