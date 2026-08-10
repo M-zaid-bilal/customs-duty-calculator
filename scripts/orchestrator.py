@@ -21,13 +21,11 @@ import chromadb
 from scripts.calculator import calculate_customs_duty, DB_PATH
 
 VECTOR_STORE_PATH = "vector_store"
-COLLECTION_NAME = "customs_legal_acts"
+COLLECTION_NAME = "customs_legal_acts"  # Aligned with build_vector_store.py
 
 # In-Memory Cache Containers
 _EXACT_QUERY_CACHE: Dict[str, Dict[str, Any]] = {}
-_SEMANTIC_CACHE: List[
-    Dict[str, Any]
-] = []  # Stores {"query_vec": Counter, "params": dict, "result": dict}
+_SEMANTIC_CACHE: List[Dict[str, Any]] = []
 
 # Global Gemini Context Cache handle
 _GEMINI_CACHE_HANDLE: Optional[str] = None
@@ -88,7 +86,6 @@ Formatting Guidelines:
 - Highlight applicable legal rules, exemptions, or valuation conditions retrieved from the legal context.
 - Keep tone authoritative, clear, and scannable.
 """
-        # Pass base_instructions directly as a string or system_instruction
         cache = client.caches.create(
             model=model,
             config=types.CreateCachedContentConfig(
@@ -117,6 +114,7 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
 
     desc_clean = item_description.strip()
 
+    # Case A: User provided no HS code -> Auto-detect via description match
     if not hs_input or hs_input.strip() == "":
         query_term = f"%{desc_clean}%"
         cursor.execute(
@@ -144,6 +142,7 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
 
     clean_hs = re.sub(r"\D", "", hs_input)
 
+    # Case B: Partial prefix provided (e.g. 4-digit '8703') -> Expand to best 8-digit sub-heading
     if len(clean_hs) < 8:
         prefix = clean_hs + "%"
         cursor.execute(
@@ -187,14 +186,15 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
             ],
         }
 
+    # Case C: Exact 8-digit HS code validation
     cursor.execute(
         "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE hs_code = ?",
         (clean_hs,),
     )
     row = cursor.fetchone()
-    conn.close()
 
     if row:
+        conn.close()
         return {
             "status": "VALID_EXACT",
             "selected_hs_code": row[0],
@@ -202,10 +202,28 @@ def resolve_hs_code(hs_input: str, item_description: str = "") -> Dict[str, Any]
             "cd_rate": row[2],
         }
     else:
-        return {
-            "status": "INVALID_CODE",
-            "message": f"HS Code '{clean_hs}' does not exist in the Pakistan Customs Tariff database.",
-        }
+        # Fallback: Invalid 8-digit HS code provided -> Try description fallback rather than crashing
+        query_term = f"%{desc_clean}%"
+        cursor.execute(
+            "SELECT hs_code, description, cd_rate FROM pct_tariff WHERE description LIKE ? AND LENGTH(hs_code) = 8 LIMIT 1",
+            (query_term,),
+        )
+        fallback_row = cursor.fetchone()
+        conn.close()
+
+        if fallback_row:
+            return {
+                "status": "INVALID_CODE_AUTO_CORRECTED",
+                "message": f"Provided HS Code '{clean_hs}' was invalid. Auto-corrected to nearest tariff match '{fallback_row[0]}'.",
+                "selected_hs_code": fallback_row[0],
+                "description": fallback_row[1],
+                "cd_rate": fallback_row[2],
+            }
+        else:
+            return {
+                "status": "INVALID_CODE",
+                "message": f"HS Code '{clean_hs}' does not exist in the Pakistan Customs Tariff database.",
+            }
 
 
 # ==========================================
@@ -264,7 +282,7 @@ def run_customs_orchestrator(
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     client = genai.Client(api_key=api_key) if api_key else None
 
-    # Params signature for math isolation
+    # Parameter signature for financial isolation
     param_signature = (
         hs_code.strip(),
         fob_usd,
@@ -282,6 +300,7 @@ def run_customs_orchestrator(
         print("⚡ [EXACT CACHE HIT] Returning instant cached report.")
         cached_res = _EXACT_QUERY_CACHE[exact_hash].copy()
         cached_res["cache_type"] = "EXACT_HASH"
+        cached_res["cache_hit"] = True
         return cached_res
 
     # --- LEVEL 2: SEMANTIC COSINE SIMILARITY CACHE ---
@@ -298,6 +317,7 @@ def run_customs_orchestrator(
                     )
                     cached_res = sem_entry["result"].copy()
                     cached_res["cache_type"] = f"SEMANTIC ({sim:.1%})"
+                    cached_res["cache_hit"] = True
                     return cached_res
 
     # Stage 1: Validate & Resolve HS Code
@@ -359,9 +379,7 @@ Formatting Guidelines:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=user_prompt,
-                    config=types.GenerateContentConfig(
-                        cached_content=cache_name  # Reuses cached instructions
-                    ),
+                    config=types.GenerateContentConfig(cached_content=cache_name),
                 )
             else:
                 response = client.models.generate_content(
@@ -378,14 +396,20 @@ Formatting Guidelines:
     else:
         report_text = f"⚠️ Gemini API Client not initialized. Checked GEMINI_API_KEY (Found: {bool(api_key)})."
 
+    # Standardized Payload with complete UI & API key aliases
     result_payload = {
         "error": False,
         "cache_type": "NONE",
+        "cache_hit": False,
+        "hs_code": target_hs,
         "resolved_hs": target_hs,
         "tariff_description": hs_resolution.get("description", ""),
         "calculation": duty_calculation,
+        "duty_calculation": duty_calculation,
         "legal_snippets": legal_snippets,
+        "legal_context": [s["text"] for s in legal_snippets],
         "ai_report": report_text,
+        "summary_report": report_text,
     }
 
     # Store in Exact & Semantic Caches
