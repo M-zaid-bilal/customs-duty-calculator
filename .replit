@@ -3,3 +3,10 @@ modules = ["python-3.11"]
 [nix]
 channel = "stable-25_05"
 packages = ["freetype", "glibcLocales"]
+
+[[ports]]
+localPort = 8080
+
+[[ports]]
+localPort = 8501
+externalPort = 80
