@@ -7,6 +7,43 @@
 __pycache__/
 *.pyc
 
-# Database files (optional: keep or ignore depending on setup)
-# Uncomment the line below if you don't want the SQLite binary in git:
-# db/*.db
+# Virtual Environment (Windows/Linux/macOS)
+.venv/
+venv/
+env/
+ENV/
+
+# Database files (SQLite)
+*.db
+*.sqlite3
+*.sqlite
+db/*.db
+vector_store/*.sqlite3
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS junk files
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+
+# Distribution / build folders
+dist/
+build/
+*.egg-info/
+
+# Jupyter Notebooks (if you don't want them)
+.ipynb_checkpoints/
+
+# Streamlit (if you have local configs)
+.streamlit/
+
+# Python compiled files
+__pycache__/
+*.py[cod]
