@@ -1,9 +1,12 @@
 streamlit>=1.30.0
 reportlab>=4.0.0
 google-genai>=0.1.1
-chromadb>=0.4.0
 requests>=2.31.0
+cffi>=1.16.0
 pdfplumber>=0.10.0
 pypdf>=4.0.0
 pytest>=8.0.0
 reportlab
+numpy
+pytest>=8.0.0
+numpy<2.5

@@ -99,10 +99,12 @@ with col_hs:
 if st.button("🚀 Calculate Customs Duty", type="primary", use_container_width=True):
     with st.spinner("Processing tariff resolution, currency rates, legal RAG, and duty waterfall..."):
         # Execute pipeline
+        hs_code_value = (hs_code_override or "").strip()
+
         result = run_customs_orchestrator(
             user_query=user_query,
             fob_usd=fob_usd,
-            hs_code=hs_code_override.strip() if hs_code_override.strip() else "",
+            hs_code=hs_code_value,
             item_description=user_query,
             ait_rate=ait_rate,
             fed_rate=fed_rate,
@@ -122,6 +124,15 @@ if st.button("🚀 Calculate Customs Duty", type="primary", use_container_width=
             st.success(f"⚡ **Instant Cache Hit!** Served via `{cache_type}` Cache in ~0.001s.")
         else:
             st.info("🤖 **Fresh AI Synthesis:** Resolved live via Gemini, ChromaDB RAG, and WeBOC waterfall calculations.")
+
+        # 1b. Legacy HS Code Transposition Notice
+        transposed_from = result.get("transposed_from")
+        if transposed_from:
+            st.warning(
+                f"🔄 **HS Code Updated:** You entered legacy HS-2017 code `{transposed_from}`, "
+                f"which has been automatically mapped to its current HS-2022 code "
+                f"`{result.get('resolved_hs', result.get('hs_code', 'N/A'))}` for this calculation."
+            )
 
         # Top KPI Summary Metrics
         duty_data = result.get("duty_calculation", {}) or result.get("calculation", {})

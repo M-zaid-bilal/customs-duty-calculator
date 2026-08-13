@@ -1,11 +1,12 @@
 import sys
 import os
+import cffi
 
 # Append Replit local packages path
 sys.path.append(os.path.abspath(".pythonlibs/lib/python3.11/site-packages"))
 
 import sqlite3
-import pdfplumber  # ty:ignore[unresolved-import]
+import pdfplumber
 
 DB_PATH = "db/customs_master.db"
 DATA_DIR = "data"
@@ -64,6 +65,19 @@ def setup_database():
     """)
 
     cursor.execute("DELETE FROM sindh_cess")
+
+    # 2b. Create HS Code Transposition Table (HS-2017 <-> HS-2022)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS hs_transposition (
+            old_hs_code TEXT,
+            old_description TEXT,
+            new_hs_code TEXT,
+            new_description TEXT,
+            remarks TEXT
+        )
+    """)
+    cursor.execute("DELETE FROM hs_transposition")
+
     sindh_slabs = [
         (0.0, 1250.0, 0.0180, 0.01),
         (1250.0, 2030.0, 0.0181, 0.01),
@@ -103,11 +117,8 @@ def setup_database():
 
                             description = row[1].strip() if row[1] else ""
                             try:
-                                raw_cd_rate = row[2]
-                                if raw_cd_rate is None:
-                                    raise ValueError
-                                cd_rate = float(str(raw_cd_rate).strip().replace("%", "")) / 100.0
-                            except (ValueError, AttributeError, TypeError):
+                                cd_rate = float((row[2] or "").strip().replace("%", "")) / 100.0
+                            except (ValueError, AttributeError):
                                 cd_rate = 0.0
 
                             cursor.execute(
@@ -123,6 +134,62 @@ def setup_database():
         print(f"🧹 Filtered out {skipped_headers} header/junk rows.")
     else:
         print("⚠️ Tariff PDF not found in data folder. Skipping tariff ingestion.")
+
+    # 4. Ingest HS Code Transposition Table (HS-2017 <-> HS-2022)
+    transposition_pdf_path = None
+    for f in os.listdir(DATA_DIR):
+        if "transposition" in f.lower() and f.endswith(".pdf"):
+            transposition_pdf_path = os.path.join(DATA_DIR, f)
+            break
+
+    if transposition_pdf_path:
+        print(f"📖 Parsing HS transposition table from: {transposition_pdf_path}")
+        transposition_rows = 0
+
+        with pdfplumber.open(transposition_pdf_path) as pdf:
+            for page in pdf.pages:
+                table = page.extract_table()
+                if not table:
+                    continue
+                for row in table:
+                    # Expected columns: [Sr, HS-2017 Code, Desc, CD%, UoM, WTO, TypeOfChange,
+                    #                     HS-2022Ref, HS-2022 Code, Desc, CD%, UoM, WTO, TypeOfChange,
+                    #                     HS-2017Ref, Remarks]
+                    if len(row) < 10:
+                        continue
+
+                    old_code = (row[1] or "").strip().replace(".", "")
+                    old_desc = (row[2] or "").strip()
+                    new_code = (row[8] or "").strip().replace(".", "")
+                    new_desc = (row[9] or "").strip()
+                    remarks = (row[15] or "").strip() if len(row) > 15 else ""
+
+                    # Skip repeated header rows and pure heading/section rows (no PCT code at all)
+                    if not old_code and not new_code:
+                        continue
+                    if old_code in ("PCT CODE", "HS-2017") or new_code in (
+                        "PCT CODE",
+                        "HS-2022",
+                    ):
+                        continue
+                    if not (old_code[:1].isdigit() or new_code[:1].isdigit()):
+                        continue
+
+                    cursor.execute(
+                        """
+                        INSERT INTO hs_transposition
+                        (old_hs_code, old_description, new_hs_code, new_description, remarks)
+                        VALUES (?, ?, ?, ?, ?)
+                    """,
+                        (old_code, old_desc, new_code, new_desc, remarks),
+                    )
+                    transposition_rows += 1
+
+        print(f"✅ Ingested {transposition_rows} HS transposition records into SQLite.")
+    else:
+        print(
+            "⚠️ HS Transposition PDF not found in data folder. Skipping transposition ingestion."
+        )
 
     conn.commit()
     conn.close()
@@ -148,6 +215,10 @@ def inspect_database():
     cursor.execute("SELECT COUNT(*) FROM sindh_cess")
     cess_count = cursor.fetchone()[0]
     print(f"\n📊 Total Slabs in 'sindh_cess': {cess_count}")
+
+    cursor.execute("SELECT COUNT(*) FROM hs_transposition")
+    transposition_count = cursor.fetchone()[0]
+    print(f"📊 Total Records in 'hs_transposition': {transposition_count}")
 
     conn.close()
 

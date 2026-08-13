@@ -1,10 +1,11 @@
 import sys
 import os
 import sqlite3
-import chromadb
 
 # Ensure local packages are reachable
 sys.path.append(os.path.abspath(".pythonlibs/lib/python3.11/site-packages"))
+
+from scripts.build_vector_store import query_legal_chunks
 
 DB_PATH = "db/customs_master.db"
 VECTOR_DIR = "vector_store"
@@ -59,29 +60,19 @@ def query_sqlite(hs_code_query):
 # ==========================================
 def query_vector_store(legal_query, n_results=2):
     print(f"\n==================================================")
-    print(f"🔍 LAYER 3 (CHROMADB): Legal Query: '{legal_query}'")
+    print(f"🔍 LAYER 3 (SQLITE FALLBACK): Legal Query: '{legal_query}'")
     print(f"==================================================")
 
-    client = chromadb.PersistentClient(path=VECTOR_DIR)
-    collection = client.get_collection(name="customs_legal_acts")
+    results = query_legal_chunks(legal_query, n_results=n_results)
 
-    results = collection.query(query_texts=[legal_query], n_results=n_results)
-
-    documents = results.get("documents")
-    metadata_list = results.get("metadatas")
-
-    docs = documents[0] if isinstance(documents, list) and documents else []
-    metas = metadata_list[0] if isinstance(metadata_list, list) and metadata_list else []
-
-    if not docs:
+    if not results:
         print("⚠️ No matching legal provisions found.")
         return
 
-    for i, (doc, meta) in enumerate(zip(docs, metas)):
-        source = meta.get("source", "Unknown") if meta else "Unknown"
-        # Print neat snippet
-        print(f"\n--- Match {i + 1} [Source: {source}] ---")
-        cleaned_doc = doc.replace("\n", " ").strip()
+    for i, result in enumerate(results, 1):
+        source = result.get("source", "Unknown")
+        cleaned_doc = result.get("text", "").replace("\n", " ").strip()
+        print(f"\n--- Match {i} [Source: {source}] ---")
         print(f"{cleaned_doc[:350]}...\n")
 
 

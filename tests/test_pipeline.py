@@ -104,10 +104,32 @@ def test_resolve_hs_code_partial_keyword_expansion():
     )  # Should dynamically pick mini van kit code!
 
 
+def test_resolve_hs_code_full_sentence_keyword_expansion():
+    """Natural-language product descriptions should still resolve to a valid HS code."""
+    res = resolve_hs_code("", item_description="I want to import a mini van vehicle")
+    assert res["status"] in {"AUTO_RESOLVED", "PARTIAL_CODE_EXPANDED"}
+    assert len(res["selected_hs_code"]) >= 4
+
+
 def test_resolve_hs_code_invalid():
     """Tests non-existent HS code input handling."""
     res = resolve_hs_code("99999999")
     assert res["status"] == "INVALID_CODE"
+
+
+def test_resolve_hs_code_transposed_legacy_code():
+    """
+    Tests that a superseded HS-2017 code is transparently resolved to its
+    current HS-2022 equivalent via the hs_transposition table.
+
+    HS-2017 code 87049010 ("Components for the assembly/manufacture of
+    vehicles, in any kit form") was reclassified under HS-2022 into the
+    general truck GVW headings as 87044100.
+    """
+    res = resolve_hs_code("87049010")
+    assert res["status"] == "VALID_EXACT"
+    assert res["selected_hs_code"] == "87044100"
+    assert res["transposed_from"] == "87049010"
 
 
 # ==========================================
